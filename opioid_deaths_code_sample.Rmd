@@ -1,0 +1,744 @@
+---
+title: "Code Sample: Ohio vs. Michigan Accidental Opioid Overdose Diff-in-Diff"
+output: 
+  pdf_document: 
+    number_sections: true
+---
+
+# Background
+
+The purpose of this analysis is to estimate the effect of 7-day opioid
+prescription limits announced in March 2017 and effective as of September 2017 
+on opioid death rates in Ohio. Since a randomized controlled trial is not 
+feasible, to determine the efficacy of the treatment, I employ a
+differences-in-differences (DiD) approach to control for time-invariant and
+individual-fixed factors that would otherwise bias estimates of treatment 
+effects. I model a simple two-group, two-period differences-in-differences
+estimation, where Ohio is my treatment group, and the neighboring state of
+Michigan is the control group. I consider August 31st, 2017 to be the date of
+treatment. The period of interest is November 2016 to June 2018, ten months
+before and after treatment, as Michigan's own 7-day prescription limits for the
+treatment of acute pain took effect in July 2018.
+
+Throughout this investigation, I will describe my data sources, clean and 
+prepare the data for analysis, conduct summary analyses of death rates in both 
+the treatment and control groups, evaluate key assumptions for valid DiD 
+analyses, fit a DiD model, and discuss the results as well as any limitations of 
+the analysis.
+
+# Analysis
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+
+# Import Packages
+
+library(tidyverse)
+library(janitor)
+library(scales)
+library(readxl)
+library(stringr)
+library(glue)
+library(psych)
+library(knitr)
+
+```
+
+## Data
+I use the CDC WONDER Multiple Cause of Death data, restricted to substance
+related underlying causes, to compare track opioid death rates in Ohio and 
+Michigan in the ten months before and after September 2017.
+
+### Importing and Merging Data
+Due to export size restrictions, I exported the data in 2-4 year subsets. Hence,
+I import multiple files and merge them below.
+
+```{r, message=FALSE, warning=FALSE}
+
+cod_raw <- list.files("/projects/lightcast-mccrary/import/jh_scratch/"
+                , pattern = "Multiple Cause of Death"
+                , full.names = TRUE) %>%
+  map_dfr(read_csv) %>%  # import and combine files in folder
+  clean_names() # clean variable names
+
+# view sample of the data and variables available
+head(cod_raw)
+
+```
+
+From this data, I have variables indicating state, year, month,
+multiple cause of death, underlying cause of death, and number of deaths.
+
+Values appear to be unavailable at the level of the data for population, crude 
+death rate, and age-adjusted death rate.
+
+### Investigating Data Quality and Availability
+
+First, I confirm that there are no duplicate observations at the state code, 
+month code, multiple cause of death code, and underlying cause of death code 
+level, which is a risk I incur when exporting data subsets and re-merging.
+
+```{r message=FALSE, warning=FALSE}
+
+# check for duplicates
+
+check_duplicates <- cod_raw %>% 
+  select(contains("code")) %>% 
+  group_by_all() %>% 
+  summarize(ct = n()) %>% 
+  filter(ct > 1)
+
+print(check_duplicates)
+
+```
+Duplicate observations appear to occur only when the values for all variables
+are null. I plan to filter these out in the cleaning step.
+
+Next, I investigate the states and years the data cover.
+
+```{r message=FALSE}
+
+distinct_years <- cod_raw %>% 
+  select(year) %>% 
+  unique() %>% 
+  print()
+
+distinct_states <- cod_raw %>% 
+  select(state) %>% 
+  unique() %>% 
+  print()
+
+```
+
+The data cover 48 states (excluding NA), including Ohio and Michigan, and 11
+years (excluding NA) from 2012 to 2020.
+
+Then, I identify how many missing values each variable has.
+
+```{r message=FALSE}
+
+missing_cts <- colSums(is.na(cod_raw)) %>% 
+  data.frame() %>% 
+  filter(. > 0) %>% 
+  print()
+
+```
+As expected from the duplicate investigation, each variable has 542 missing
+values, except for $\textit{notes}$, which has 31,263 missing values and will
+not be used in the analysis anyways.
+
+## Clean and Prepare Data for Analysis
+
+In this next part, I clean and prepare my data for analysis. This includes
+1. filtering the data to the states, periods, and death causes of interest, 2.
+aggregating deaths across underlying causes, 3. transforming variables as
+needed, 4. joining ALFRED state-level population data to calculate death rates,
+and 5. creating time and treatment dummies to be used in the diff-in-diff
+analyses.
+
+Below, I filter my data to Ohio and Michigan in the periods spanning December 
+2016 to June 2018. In addition, I limit underlying causes of death to ICD-10 
+underlying cause of death codes X40-X44 and multiple causes of death to 
+opioid-related ICD multiple cause of death codes: T40.1, T40.2, T40.3, T40.4,
+and T40.6, as is standard* in analyses of accidental opioid overdoses.
+
+*https://ibis.utah.gov/ibisph-view/pdf/resource/query/DrugOverdoseMortalityCodes.pdf
+
+```{r message=FALSE}
+
+cod_clean <- cod_raw %>% 
+  mutate(month = as.Date(paste0(year, substring(month_code, 6, 7), "01"), format="%Y%m%d")) %>% 
+  filter(
+    # filter periods
+    month >= "2016-11-01"
+    , month <= "2018-06-01"
+    # filter groups
+    , state %in% c("Ohio", "Michigan")
+    # limit to accidental poisoning & opioid-related death codes
+    , str_detect(underlying_cause_of_death_code, "^X4[0-4]$")
+    , multiple_cause_of_death_code 
+        %in% c("T40.1", "T40.2", "T40.3", "T40.4", "T40.6")
+    ) %>% 
+  mutate(
+    state
+    , year
+    , month
+    , multiple_cause_of_death
+    , multiple_cause_of_death_code
+    , deaths) %>%
+  group_by(state, year, month
+           , multiple_cause_of_death
+           , multiple_cause_of_death_code) %>% 
+  # aggregate opioid deaths
+  summarize(deaths = sum(deaths)) %>% 
+  ungroup()
+
+```
+
+Note that in the above chunk, I aggregated opioid deaths across underlying
+causes of death. This does not introduce potential for multi-counting certain
+deaths, since each death certificate lists a single underlying cause of death, 
+and, thus, the groups are mutually exclusive. However, if I were to aggregate
+across multiple causes of death, I would run the risk of double counting deaths,
+for more than one multiple cause of death can be associated with more than one
+multiple causes of death. In fact, the risk is even high considering the context
+of the analysis being drug overdoses, where more than one drug is often found in
+a person's system in the event of an overdose. See 
+https://wonder.cdc.gov/wonder/help/ucd.html for more information on how
+ICD-10 codes map to death certificates.
+
+Furthermore, I inspect the availability of ICD-10 code reporting in Ohio and
+Michigan during the analysis period.
+
+```{r}
+
+check_cod_availability <- cod_clean %>% 
+  filter(state %in% c("Ohio", "Michigan")) %>% 
+  group_by(state, multiple_cause_of_death) %>% 
+  summarize(ct = n()) %>% 
+  ungroup() %>% 
+  print()
+
+```
+
+Reporting on Methadone (T40.3) and Other Unspecified Narcotics (T40.6) is 
+limited during the period of analysis period for both states. Though, both Ohio 
+and Michigan report death counts for Heroin, Other Opioids, and Other Synthetic 
+Narcotics in all 20 periods. If multiple cause of death ICD-10 groups were 
+mutually exclusive, I would consider aggregating these groups, however, as 
+previously discussed, we can not aggregate without inviting double counting 
+risks. Yet more, aggregation poses conceptual risks, as there are meaningful 
+differences between these groups that may obfuscate from the true treatment 
+effects at a given time. For example, Heroin use often occurs later in the cycle 
+of opioid addiction, so changes in Heroin-related accidental drug deaths may 
+take longer to appear as a result of an intervention at an initial prescription. 
+Also, by forfeiting this variation, I would lose the ability to analyze the role 
+of substitution as a continuation of this analysis (i.e. Do prescription caps 
+lead those experiencing addiction to substitute Heroin for Other Opioids?).
+
+Thus, I elect to keep the codes disaggregated, but I restrict my analysis to the 
+three ICD-10 groups that are completely represented across all periods. 
+
+Now, I join the data to the ALFRED population data. Since the ALFRED
+population data is only available by state at the annual-level, I assume linear
+population growth to interpolate the state populations in a given month. Note
+that the ALFRED population data is referenced to July 1.
+
+```{r}
+
+alfred <- read_xlsx("/projects/lightcast-mccrary/import/jh_scratch/US_population_by_state.xlsx"
+                    , sheet = "Annual") %>%
+  # add buffer years for lead and lag calculations
+  filter(year(observation_date) >= 2015
+         , year(observation_date) <= 2020) %>% 
+  pivot_longer(cols = contains("POP")
+               , names_to = "state"
+               , values_to = "population") %>% 
+  transmute(year = year(observation_date)
+            , state = state.name[match(str_remove(state, "POP"), state.abb)]
+            , population = population*1000) %>% 
+  arrange(year) %>% 
+  group_by(state) %>% 
+  mutate(population_lead = lead(population, 1)
+         , population_lag = lag(population, 1))
+  
+cod_joined <- cod_clean %>% 
+  filter(multiple_cause_of_death_code 
+        %in% c("T40.1", "T40.2", "T40.4")) %>% 
+  left_join(alfred, by = c("year", "state")) %>% 
+  # transform population in a month as a weighted average of 
+  # the distance between two annual population estimates
+  mutate(
+    # subtract 7 from month to anchor July as 0
+    month_num = as.numeric(month(month)) - 7
+          # no change to July population
+         , population = case_when(month_num == 0 ~ population
+                          # for August-December, weight by distance from 
+                          # population estimate in current and next year           
+                          , month_num > 0 ~ (month_num*population_lead 
+                                        + (12-month_num)*population)/12
+                          # for January-June, weight by distance from 
+                          # population estimate in current and prior year 
+                          , month_num < 0 ~ (-month_num*population_lag
+                                        + (12+month_num)*population)/12)
+         , death_rate_100k = 100000*deaths/population) %>% 
+  select(state
+       , month
+       , multiple_cause_of_death
+       , deaths
+       , population
+       , death_rate_100k)
+
+```
+
+Then, I add my treatment and control dummies to prepare the data for the DiD
+analyses.
+
+```{r}
+
+cod_diff_in_diff <- cod_joined %>%
+  mutate(time_dum = if_else(month >= "2017-09-01", 1, 0)
+         , treated_dum = if_else(state == "Ohio", 1, 0))
+
+```
+
+# Summary Analyses
+
+## Summary Table of Death Rates
+
+Before performing regression analyses, I pull summary statistics of death rates 
+by state, pre- vs. post- treatment, and ICD-10 multiple cause of death codes.
+
+```{r}
+
+death_rate_summary_stats <- cod_diff_in_diff %>% 
+  group_by(multiple_cause_of_death, time_dum, state) %>% 
+  summarize(n = n()
+            , mean = mean(death_rate_100k, na.rm=TRUE)
+            , sd = sqrt(mean((death_rate_100k 
+                              - mean(death_rate_100k, na.rm=TRUE))^2
+                             , na.rm=TRUE))
+            , median = median(death_rate_100k, na.rm=TRUE)
+            , min = min(death_rate_100k, na.rm = TRUE)
+            , max = max(death_rate_100k, na.rm = TRUE)) %>% 
+  ungroup() %>% 
+  print()
+
+```
+For Heroin-related deaths, it appears that the mean death rate is closer in
+magnitude after treatment than before treatment. For Other Opioids and Other 
+Synthetic Opioids, this is also true.
+
+I also perform a cursory evaluation of pre-treatment summary statistics.
+
+```{r message=FALSE, warning=FALSE}
+
+pre_trend_investigation <- cod_diff_in_diff %>% 
+  filter(time_dum == 0) %>% 
+  group_by(multiple_cause_of_death, state) %>% 
+  summarize(mean_death_rate = mean(death_rate_100k, na.rm=TRUE)
+            , mean_population = mean(population, na.rm=TRUE)
+            # calculate death rate linear trend
+            , death_rate_slope = (last(death_rate_100k) 
+                                  - first(death_rate_100k))/(n()-1)) %>% 
+  print()
+
+```
+
+Crucially, upon visual inspection of the numbers, the linear trends of Michigan
+and Ohio appear most parallel for Other Synthetic Narcotics. However, I do not 
+perform any tests at this point to evaluate the statistical strength of this 
+relationship.
+
+# Evaluate Key Assumptions
+
+Some necessary conditions for DiD estimation to be valid include the following:
+
+1. Pre-treatment trends are parallel.
+
+2. The Stable Unit Treatment Value Assumption (SUTVA) holds.
+
+I perform statistical tests to evaluate item 1 and provide a conceptual
+discussion of item 2.
+
+## Assumption 1: Parallel Trends
+
+As a two-group, two-period implementation of a two-way fixed effects model, a
+DiD analysis requires that there are no confounding variables that vary with
+time and between groups. In other words, parallel trends hold. For example, if 
+Michigan were to (and did in fact) expand access to opioid counseling in the 
+time between September 2017 and July 2018, then the DiD method would not account 
+for this factor and the estimated average treatment effect would be biased 
+(omitted variable bias). In a formal research investigation, I would research 
+policy and demographic changes and control for any time-varying differences 
+between the groups in my regression.
+
+### Trend Visualizations
+
+To verify parallel trends, or, at the very least, not rule them out, I chart
+death rates in Ohio and Michigan over time, and perform a visual inspection.
+
+```{r}
+
+chart_input_df <- data.frame(cause_of_death = 
+                         c("T40.1" = "Heroin"
+                           , "T40.2" = "Other opioids"
+                           , "T40.4" = "Other synthetic narcotics"))
+
+chart_ts <- function(cause_of_death){
+  
+  chart_data <- cod_diff_in_diff %>% 
+    filter(multiple_cause_of_death == cause_of_death)
+  
+  y_min = floor(min(chart_data$death_rate_100k, na.rm = TRUE))
+  
+  y_max = ceiling(max(chart_data$death_rate_100k, na.rm = TRUE))
+  
+  timeseries <- 
+    ggplot(chart_data
+    ) +  
+    geom_line(aes(x = month
+                  , y = death_rate_100k
+                  , color = state
+                  , group = state)
+    ) +
+    scale_y_continuous(expand = c(0, 0)
+                       , breaks = seq(y_min, y_max, by = 0.2)
+                       , limits = c(y_min, y_max)
+    ) +
+    scale_x_date(expand = c(0, 0)
+                 , date_breaks = "1 month"
+                 , date_labels = "%b %Y"
+    ) +
+    geom_vline(xintercept = as.Date("2017-09-01")
+               , linetype = "longdash"
+    ) +
+    annotate("text"
+             , x = as.Date("2017-09-01")
+             , y = Inf
+             , label = "Ohio Prescription Limit Effective"
+             , angle = 90
+             , family = "serif"
+             , vjust = -.5
+             , hjust = 1
+             , size = 3.5
+             , color = "black"
+    ) +
+    scale_color_manual(values = c('Ohio' = '#E41A1C', 'Michigan' = '#254061')
+    ) +
+    labs(title = glue("Opioid Related Deaths in Michigan vs. Ohio")
+         , subtitle = glue("{str_to_title(cause_of_death)}, Nov 2016 - Jun 2018")
+         , y = glue("Deaths per 100k")
+         , x = ""
+    ) +
+    theme_classic() +
+    theme(text = element_text(family = "serif", size = 10)
+          , plot.title = element_text(hjust = 0.5, face = "bold", size = 16)
+          , plot.subtitle = element_text(hjust = 0.5, size = 12)
+          , axis.text.x = element_text(angle = 60, hjust = 1, size = 8)
+          , axis.text.y = element_text(size = 9)
+          , axis.title.y = element_text(size = 11)
+          , legend.position = "bottom"
+          , legend.box = "horizontal"
+          , legend.title = element_blank()
+    )
+  
+}
+
+charts <- pmap(chart_input_df, chart_ts)
+
+```
+
+```{r}
+
+# Review trends in Heroin-related accidental overdose deaths
+
+heroin_trends <- charts[[1]] %>% 
+  plot()
+
+```
+Upon visual inspection, trends appear to be generally on par in terms of
+Heroin deaths in the period leading up to September 2017. Notably, they seem to
+diverge slightly in the few months after prescription limits are effective but
+converge around December 2017.
+
+```{r}
+
+# Review trends in Other Opioid-related accidental overdose deaths
+other_opioid_trends <- charts[[2]] %>% 
+  plot()
+
+```
+Trends appear somewhat parallel until January 2017 when they diverge sizeably 
+and then dramatically after March 2017. Strikingly, death rates appear to converge 
+and then diverge again in the period prior to treatment. Trends appear more 
+parallel after treatment than before.
+
+I also notice a spike in Other Opioid death rates in Ohio in April 2017 that
+persists for two months until June 2017. There may be some sort of external shock 
+that is affecting Other Opioid death rates in this period. In a more expansive 
+analysis, I would likely conduct some public research to see if I can explain and 
+attempt to control for the factors driving the pre-treatment spike.
+
+```{r}
+
+# Review trends in Other Synthetic Narcotic-related accidental overdose deaths
+
+synthetic_trends <- charts[[3]] %>% 
+  plot()
+
+```
+Trends in Other Synthetic Narcotic death rates appear somewhat parallel, barring
+a few spikes in Ohio's death rate, up until treatment and two months past treatment.
+After November 2017, Other Synthetic Narcotic-related death rates begin trending
+downward and flattening out. A delayed treatment effect may make sense as this 
+category is primarily composed of Fentanyl deaths; Fentanyl is typically used in 
+later stages of the course of addiction. There are several sharp spikes that 
+indicate there may be a seasonal component to deaths or even reporting of the 
+deaths. I considered using an MA(3) transformation of death rates to smooth the 
+trend, but, due to concerns about limitations to inference introduced by serial 
+correlation in a two-group setting (unable to cluster SE's), I elected to 
+continue with raw death rates.
+
+### Statistical Tests of Trends
+
+Now, I perform a simple linear regression test to see if parallel trends are violated. 
+In particular, I test whether there is a significant interaction between the month
+$\textit{t}$ and group $\textit{i}$ (state) in the pre-treatment period.
+
+The model treats deaths per 100,000 as a linear function of treatment period and 
+treatment group (Ohio) dummies as well as the interaction between the two 
+dummies:
+
+$$DeathRate100k_{ti} = \beta_0+\beta_1*Month_{t} + \beta_2*Ohio_{i} + \beta_3*Month_{t}\times Ohio_{i}\\ \quad t \in \{1,2,...Treatment\;Month - 1\},\quad i\in\{0,1\}$$
+
+```{r}
+
+model_pre_trends <- function(cause_of_death){
+  
+  # filter to pre-treatment data
+  pre_trend_data <- cod_diff_in_diff %>% 
+    filter(multiple_cause_of_death == cause_of_death
+           , time_dum == 0) %>% 
+    # get time period
+    mutate(time_num = match(month, unique(cod_diff_in_diff$month)) - 1)
+  
+  # evaluate whether we can reject null hypothesis on the interaction
+  # between the period and the group: B = 0
+  model <- lm(death_rate_100k ~ time_num * treated_dum, data = pre_trend_data)
+  
+  summary(model)
+  
+}
+
+pre_trends <- pmap(chart_input_df, model_pre_trends)
+
+```
+
+I am testing $H_0: \beta_3 = 0$ and $H_a: \beta_3 \neq 0$ . If $H_0$ is
+rejected, then parallel trends are violated. If I fail to reject $H_0$, then
+the outcome of this test is consistent with parallel trends, but it is not
+definitive. In particular, failure to reject a null hypothesis does not imply
+and acceptance of the alternative hypothesis.
+
+```{r}
+
+heroin_pre_trends <- pre_trends[[1]] %>% 
+  print()
+
+```
+For Heroin, I reject $H_0$. $\beta_3$ is significant at the 99% confidence 
+level (P-Value = 0.002).
+
+```{r}
+
+other_opioid_pre_trends <- pre_trends[[2]] %>% 
+  print()
+
+```
+For Other Opioids, I fail to reject the null hypothesis. $\beta_3$ is 
+insignificant and close to zero.
+
+```{r}
+
+synthetic_pre_trends <- pre_trends[[3]] %>% 
+  print()
+
+```
+
+For Other Synthetic Narcotics, I fail to reject the null hypothesis. $\beta_3$ 
+is insignificant and close to zero.
+
+Furthermore, I considered an event study approach to pre-testing 
+(He & Wang, 2017). Though, it is possible that there are alternative functional 
+forms that would output similar pre-trend coefficients but yield substantial 
+bias (Roth, 2019).
+
+While I can neither verify or reject parallel trends outright, I continue with 
+this assumption for Other Opioids and Other Synthetic Narcotics for the sake of 
+the exercise. I recognize the limitations this imposes on the validity of the 
+results.
+
+## Assumption 2: SUTVA
+
+An unbiased DiD analysis would require that the composition of the comparison 
+groups remain stable over the analysis period. In addition, the treatment of one 
+group should not affect outcomes in the other group. In this case, we must 
+assume that people did not move in and out of Michigan or Ohio in any way that 
+would impact opioid-related death rates. One other essential consideration in
+analyses of addiction or any sort of epidemiological question, for that matter,
+is whether or not the remaining living population is equally susceptible to
+addiction. In other words, if the majority of people who are prone to opioid
+addiction or vulnerable to poor prescription practices in Ohio have already died 
+of opioid overdoses, then we may see death rates decrease, even though it would
+not be a result of the policy intervention. Moreover, spillover effects are
+possible, since Michigan and Ohio are neighboring states. Those suffering from
+an opioid addiction in Ohio may cross state lines to seek prescriptions if they
+are denied their desired quantity. Or, if fewer people are addicted
+to opioids in Ohio, producers and sellers of Heroin and Fentanyl may turn to
+larger, nearby markets, like Michigan to maintain or increase sales.
+
+Despite the limitations discussed, I proceed with the analysis taking these
+assumptions as given for the sake of the exercise.
+
+# Fitting the Differences-in-Differences Model
+
+For illustrative purposes, I derive the average treatment effect (ATE) of opioid
+prescription limits using an algebraic and a regression method. Both methods
+should yield the same results.
+
+## Algebraic ATE Estimation
+
+Conceptually, the average treatment effect in a DiD model is the difference 
+between (between estimator) the difference between the pre- and post- treatment 
+means within each group (within estimator).
+
+The ATE is algebraically defined as follows:
+
+$$Average\;Treatment\;Effect = ({Y_{Ohio,\;1}} - {Y_{Ohio,\;0}}) - ({Y_{Michigan,\;1}} - {Y_{Michigan,\;0}}),\quad 1 = On\;or\;after\;September\; 2017$$
+
+```{r}
+
+get_ate <- function(cause_of_death){
+
+yt1 = cod_diff_in_diff %>% 
+  filter(treated_dum == 1, time_dum == 1
+         , multiple_cause_of_death == cause_of_death) %>% 
+  pull(death_rate_100k) %>% 
+  mean(., na.rm = TRUE)
+
+yt0 = cod_diff_in_diff %>% 
+  filter(treated_dum == 1, time_dum == 0
+         , multiple_cause_of_death == cause_of_death) %>% 
+  pull(death_rate_100k) %>% 
+  mean(., na.rm = TRUE)
+
+yc1 = cod_diff_in_diff %>% 
+  filter(treated_dum == 0, time_dum == 1
+         , multiple_cause_of_death == cause_of_death) %>% 
+  pull(death_rate_100k) %>% 
+  mean(., na.rm = TRUE)
+
+yc0 = cod_diff_in_diff %>% 
+  filter(treated_dum == 0, time_dum == 0
+         , multiple_cause_of_death == cause_of_death) %>% 
+  pull(death_rate_100k) %>% 
+  mean(., na.rm = TRUE)
+
+treatment_effect = (yt1 - yt0) - (yc1 - yc0)
+
+}
+
+input_df <- data.frame(cause_of_death = 
+                         c("T40.2" = "Other opioids"
+                           , "T40.4" = "Other synthetic narcotics"))
+
+ate <- pmap(input_df, get_ate)
+
+ate
+
+```
+
+The estimated ATE of the treatment on Other Opioid-related accidental overdose
+deaths is -0.24. For Other Synthetic Narcotics, the ATE is -0.68. I interpret 
+and discuss these results in the next section.
+
+## Regression ATE Estimation
+
+Now, I fit a regression model to estimate the ATE of the DiD.
+
+$$Death\;Rates\;100k_{ij} = \beta_0 + \beta_1*State_i + \beta_2*Treatment\;Period_j + \beta_3*State_i\times Treatment\;Period_j + \varepsilon_{ij}, \; i,j\in\{0,1\}$$
+
+```{r}
+
+get_est <- function(cause_of_death){
+  
+model_data <- cod_diff_in_diff %>% 
+  filter(multiple_cause_of_death == cause_of_death)
+
+model <- lm(death_rate_100k ~ time_dum + treated_dum + time_dum:treated_dum
+            , data = model_data)
+
+summary(model)
+
+}
+
+diff_in_diff <- pmap(input_df, get_est)
+
+```
+
+
+```{r}
+
+lm_other_opiods = diff_in_diff[[1]] %>% 
+  print()
+
+```
+Like the algebraic representation, $\widehat{ATE} = \hat{\beta_3} = -0.24$, for
+Other Opioid-related accidental overdose deaths. This result is significant
+at the 99% Confidence Level (P-Value = 0.0013).
+
+Given all necessary DiD assumptions hold, we could conclude that Ohio's 7-Day 
+opioid prescription limit for acute pain had the effect of reducing accidental
+Other Opioid-related overdose deaths by 0.24 deaths per 100k. 
+
+```{r message=FALSE, warning=FALSE}
+
+average_post_treatment_pop <- cod_joined %>% 
+  filter(state == "Ohio"
+         , month >= "2017-09-01") %>% 
+  summarize(mean = mean(population, na.rm = TRUE)) %>% 
+  pull()
+
+crude_other_opioid <- (ate[[1]]/100000)*average_post_treatment_pop
+
+crude_other_opioid
+
+```
+
+Adjusted for Ohio's average population from September 2017 to June 2018, this 
+translates to an average of 28.4 fewer Other Opioid-related deaths per month.
+
+```{r}
+
+ate_lm_synthetic_narcotics = diff_in_diff[[2]] %>% 
+  print()
+
+```
+Like the algebraic representation, $\widehat{ATE} = \hat{\beta_3} = -0.68$, for
+Other Synthetic Narcotic-related accidental overdose deaths. This result is 
+significant at the 99.9% Confidence Level (P-Value = 0.0006). 
+
+Given all necessary DiD assumptions hold, we could conclude that Ohio's 7-Day 
+opioid prescription limit for acute pain had the effect of reducing accidental
+Other Synthetic Narcotic-related overdose deaths by 0.68 deaths per 100k. 
+
+```{r message=FALSE, warning=FALSE}
+
+crude_synthetic_narcotics <- (ate[[2]]/100000)*average_post_treatment_pop
+
+crude_synthetic_narcotics
+
+```
+
+Adjusted for Ohio's average population from September 2017 to June 2018, this 
+translates to an average of 79 fewer Other Synthetic Narcotic-related deaths per 
+month.
+
+Both of these results being negative is directionally consistent with what we 
+would expect from an intervention intended to decrease opioid deaths.
+
+# Limitations & Discussion
+
+I conclude that, given all assumptions hold for the sake of the exercise, the
+causal effects of Ohio's policy intervention on Other Opioid- and Other Synthetic
+Narcotic-related death rates were negative and significant. One additional
+limitation, which I have not yet discussed, is the fact that Ohio's new prescription
+limit policy was announced in March 2017, six months in advance of its effective
+date. This means that, in the time leading up to treatment, while not required to
+do so, clinicians may have begun complying with these guidelines to align with
+professional standards. As a result, the effects of this policy may have spilled
+over into these earlier months. This could invalidate the conclusions I drew
+from the parallel trends analyses and mean that my ATE estimates I reported are 
+biased in such a way that they are smaller in magnitude than the true values.
+
+
